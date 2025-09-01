@@ -1,4 +1,4 @@
-# app.py (LOCAL STORAGE MODE)
+# app.py (LOCAL STORAGE MODE, no camera input)
 # Streamlit photo sharing for 6 people — saves files under ./uploads/{name}/{album}
 # No Supabase/S3 required. Keep this server running so others can upload/download.
 #
@@ -108,10 +108,7 @@ with tab_upload:
             "Choose photos", type=["jpg","jpeg","png","heic","webp"], accept_multiple_files=True
         )
 
-        st.markdown("**Or take a photo now**")
-        snap = st.camera_input("Take a picture (optional)")
-
-        if st.button("⬆️ Upload", type="primary", disabled=not (user and album and (files or snap))):
+        if st.button("⬆️ Upload", type="primary", disabled=not (user and album and files)):
             uploaded = 0
             bundle: List[Tuple[str, bytes]] = []
 
@@ -133,11 +130,6 @@ with tab_upload:
                 except Exception:
                     pass
                 bundle.append((name, data))
-
-            # Snapshot from camera
-            if snap is not None:
-                name = f"camera_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
-                bundle.append((name, snap.getvalue()))
 
             # Local save
             with st.spinner("Saving..."):
