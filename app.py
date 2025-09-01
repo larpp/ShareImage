@@ -1,21 +1,15 @@
-# app.py
-# Streamlit photo sharing demo for 6 people
-# Features
-# - People type their name, pick/enter an album name, and upload multiple photos from phone gallery
-# - (Mobile) Optional: take a photo with the camera via st.camera_input
-# - Photos are stored in Supabase Storage under bucket "photoshare" with path {user}/{album}/{filename}
-# - Everyone can browse albums and download an album as a ZIP
+# app.py (LOCAL STORAGE MODE)
+# Streamlit photo sharing for 6 people — saves files under ./uploads/{name}/{album}
+# No Supabase/S3 required. Keep this server running so others can upload/download.
 #
 # Setup
-# 1. pip install -r requirements.txt
-# 2. Set env vars: SUPABASE_URL, SUPABASE_ANON_KEY (or service key). Create storage bucket "photoshare" (public)
-# 3. streamlit run app.py
+# 1) pip install -r requirements.txt
+# 2) streamlit run app.py
 #
 # requirements.txt (example)
 # streamlit>=1.37
-# supabase>=2.6
 # pillow
-# pillow-heif  # to support HEIC on iPhone (optional)
+# pillow-heif  # optional, for HEIC support on iPhone
 
 import io
 import os
@@ -33,38 +27,22 @@ try:
 except Exception:
     pass
 
-# --- Supabase client
-from supabase import create_client
-
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-
-if not SUPABASE_URL or not SUPABASE_KEY:
-    st.warning(
-        "Supabase env vars not set. Browsing will still render, but uploads won't persist.\n"
-        "Set SUPABASE_URL and SUPABASE_ANON_KEY in your environment."
-    )
-
-@st.cache_resource(show_spinner=False)
-def get_sb():
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return None
-    return create_client(SUPABASE_URL, SUPABASE_KEY)
-
-sb = get_sb()
-BUCKET = "photoshare"
-
+# ------------------------------
+# App Config & Constants
+# ------------------------------
 st.set_page_config(page_title="Photo Share (6 people)", page_icon="📸", layout="wide")
 
+# Root folder for local storage
+BASE_DIR = os.path.abspath("uploads")
+os.makedirs(BASE_DIR, exist_ok=True)
+
 # --- Simple password gate (all 6 people share one password)
-# Default password; can be overridden by env var or secrets if present
 PASS = os.getenv("APP_PASS") or "eggmongol"
-# Try reading from st.secrets if configured, but don't crash if not
 try:
+    # If secrets.toml is configured, allow override
     if hasattr(st, "secrets") and isinstance(st.secrets, dict) and "APP_PASS" in st.secrets:
         PASS = st.secrets["APP_PASS"]
 except Exception:
-    # secrets.toml not configured; ignore
     pass
 
 if "authed" not in st.session_state:
@@ -93,15 +71,25 @@ if not st.session_state.authed:
             st.error("Wrong password. Try again.")
     st.stop()
 
-
-# --- Sidebar: simple identity
+# ------------------------------
+# Sidebar: identity
+# ------------------------------
 st.sidebar.header("👤 Who are you?")
 user = st.sidebar.text_input("Your name (e.g., Jiho)", max_chars=24).strip()
 if not user:
     st.sidebar.info("Type your name so your uploads are grouped correctly.")
 
-# --- Tabs
+# ------------------------------
+# Tabs
+# ------------------------------
 tab_upload, tab_browse = st.tabs(["Upload", "Browse & Download"]) 
+
+# Utility: ensure album folder
+
+def ensure_album_folder(u: str, a: str) -> str:
+    folder = os.path.join(BASE_DIR, u, a)
+    os.makedirs(folder, exist_ok=True)
+    return folder
 
 # ------------------------------
 # Upload Tab
@@ -124,71 +112,57 @@ with tab_upload:
         snap = st.camera_input("Take a picture (optional)")
 
         if st.button("⬆️ Upload", type="primary", disabled=not (user and album and (files or snap))):
-            if not sb:
-                st.error("Supabase not configured. Set env vars and restart.")
-            else:
-                uploaded = 0
-                # bundle files list including snap if present
-                bundle: List[Tuple[str, bytes]] = []
+            uploaded = 0
+            bundle: List[Tuple[str, bytes]] = []
 
-                # Multiple files from gallery
-                for f in files or []:
-                    name = f.name
+            # Multiple files from gallery
+            for f in files or []:
+                name = f.name
+                try:
+                    data = f.read()
+                except Exception:
+                    data = f.getvalue()
+                # Normalize to JPEG for consistent preview/orientation
+                try:
+                    img = Image.open(io.BytesIO(data))
+                    rgb = img.convert("RGB")
+                    buf = io.BytesIO()
+                    rgb.save(buf, format="JPEG", quality=90, optimize=True)
+                    data = buf.getvalue()
+                    name = os.path.splitext(name)[0] + ".jpg"
+                except Exception:
+                    pass
+                bundle.append((name, data))
+
+            # Snapshot from camera
+            if snap is not None:
+                name = f"camera_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+                bundle.append((name, snap.getvalue()))
+
+            # Local save
+            with st.spinner("Saving..."):
+                folder = ensure_album_folder(user, album)
+                for name, data in bundle:
+                    path = os.path.join(folder, name)
                     try:
-                        data = f.read()
-                    except Exception:
-                        data = f.getvalue()
-                    # Ensure orientation-correct JPEG for HEIC / others
-                    try:
-                        img = Image.open(io.BytesIO(data))
-                        # Convert to RGB JPEG to normalize format & EXIF orientation
-                        rgb = img.convert("RGB")
-                        buf = io.BytesIO()
-                        rgb.save(buf, format="JPEG", quality=90, optimize=True)
-                        data = buf.getvalue()
-                        name = os.path.splitext(name)[0] + ".jpg"
-                    except Exception:
-                        # If not an image we can open, keep raw
-                        pass
-                    bundle.append((name, data))
-
-                # Snapshot from camera
-                if snap is not None:
-                    name = f"camera_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
-                    bundle.append((name, snap.getvalue()))
-
-                # Upload to Supabase Storage
-                with st.spinner("Uploading..."):
-                    for name, data in bundle:
-                        path = f"{user}/{album}/{name}"
-                        try:
-                            sb.storage.from_(BUCKET).upload(path, data, {
-                                "contentType": "image/jpeg" if name.lower().endswith(".jpg") else "application/octet-stream",
-                                "upsert": True,
-                            })
-                            uploaded += 1
-                        except Exception as e:
-                            st.error(f"Failed: {name} — {e}")
-                st.success(f"Uploaded {uploaded} file(s) to {user}/{album}")
+                        with open(path, "wb") as f:
+                            f.write(data)
+                        uploaded += 1
+                    except Exception as e:
+                        st.error(f"Failed: {name} — {e}")
+            st.success(f"Uploaded {uploaded} file(s) to {user}/{album}")
 
     with colB:
         st.subheader("What others will see")
         st.caption("Below is how your album appears to everyone")
-        if sb and user and album:
-            # List objects in this album
-            prefix = f"{user}/{album}/"
-            try:
-                objs = sb.storage.from_(BUCKET).list(prefix)
-            except Exception:
-                objs = []
+        if user and album:
             thumbs = []
-            for o in objs:
-                if o["name"].startswith("."):
-                    continue
-                rel = prefix + o["name"]
-                public_url = sb.storage.from_(BUCKET).get_public_url(rel)
-                thumbs.append(public_url)
-
+            folder = os.path.join(BASE_DIR, user, album)
+            if os.path.isdir(folder):
+                for fname in sorted(os.listdir(folder)):
+                    if fname.startswith("."):
+                        continue
+                    thumbs.append(os.path.join(folder, fname))
             if thumbs:
                 st.image(thumbs, width=150)
             else:
@@ -201,51 +175,51 @@ with tab_upload:
 # ------------------------------
 with tab_browse:
     st.header("Browse everyone's albums")
-    if not sb:
-        st.warning("Supabase not configured; cannot list albums.")
-    else:
-        # list all top-level users (folders)
-        users = [o["name"] for o in sb.storage.from_(BUCKET).list("") if o.get("id") is None and o.get("name")]  # folders
-        if not users:
-            st.info("No uploads yet. Albums will appear here.")
-        else:
-            u = st.selectbox("Select a person", options=users)
-            albums = [o["name"] for o in sb.storage.from_(BUCKET).list(f"{u}/") if o.get("id") is None and o.get("name")] 
-            if albums:
-                a = st.selectbox("Select an album", options=albums)
-                prefix = f"{u}/{a}/"
-                files = sb.storage.from_(BUCKET).list(prefix)
-                cols = st.columns(4)
-                images = []
-                for i, fobj in enumerate(files):
-                    if fobj.get("id") is None:  # folder
-                        continue
-                    rel = prefix + fobj["name"]
-                    url = sb.storage.from_(BUCKET).get_public_url(rel)
-                    images.append((fobj["name"], url, rel))
-                    cols[i % 4].image(url, caption=fobj["name"], use_container_width=True)
 
-                # Download ZIP of this album
-                if images:
-                    if st.button("⬇️ Download this album as ZIP"):
-                        zip_buf = io.BytesIO()
-                        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                            for fname, url, rel in images:
-                                # fetch bytes from storage (signed URL download)
-                                try:
-                                    data = sb.storage.from_(BUCKET).download(rel)
-                                    zf.writestr(fname, data)
-                                except Exception as e:
-                                    st.error(f"Failed to add {fname}: {e}")
-                        zip_buf.seek(0)
-                        st.download_button(
-                            label="Download ZIP",
-                            data=zip_buf,
-                            file_name=f"{u}_{a}.zip",
-                            mime="application/zip",
-                        )
-            else:
-                st.info("No albums for this person yet.")
+    # List people (top-level dirs)
+    users: List[str] = []
+    for entry in sorted(os.listdir(BASE_DIR)):
+        if os.path.isdir(os.path.join(BASE_DIR, entry)):
+            users.append(entry)
+
+    if not users:
+        st.info("No uploads yet. Albums will appear here.")
+    else:
+        u = st.selectbox("Select a person", options=users)
+        u_dir = os.path.join(BASE_DIR, u)
+        albums = [d for d in sorted(os.listdir(u_dir)) if os.path.isdir(os.path.join(u_dir, d))]
+        if albums:
+            a = st.selectbox("Select an album", options=albums)
+            folder = os.path.join(BASE_DIR, u, a)
+            files = [f for f in sorted(os.listdir(folder)) if os.path.isfile(os.path.join(folder, f))]
+
+            cols = st.columns(4)
+            images = []  # (fname, fullpath)
+            for i, fname in enumerate(files):
+                fpath = os.path.join(folder, fname)
+                images.append((fname, fpath))
+                cols[i % 4].image(fpath, caption=fname, use_container_width=True)
+
+            # Download ZIP of this album
+            if images:
+                if st.button("⬇️ Download this album as ZIP"):
+                    zip_buf = io.BytesIO()
+                    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                        for fname, fullpath in images:
+                            try:
+                                with open(fullpath, "rb") as f:
+                                    zf.writestr(fname, f.read())
+                            except Exception as e:
+                                st.error(f"Failed to add {fname}: {e}")
+                    zip_buf.seek(0)
+                    st.download_button(
+                        label="Download ZIP",
+                        data=zip_buf,
+                        file_name=f"{u}_{a}.zip",
+                        mime="application/zip",
+                    )
+        else:
+            st.info("No albums for this person yet.")
 
 # --- Footer
-st.caption("Privacy tip: this demo uses a public bucket for simplicity. For private sharing, switch to signed URLs and add passcodes.")
+st.caption("Local mode: files are stored on this server under ./uploads. Keep the server running for sharing.")
